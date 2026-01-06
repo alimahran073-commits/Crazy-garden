@@ -253,12 +253,51 @@
       from { opacity: 0; transform: translateY(6px); }
       to { opacity: 1; transform: translateY(0); }
     }
+
+    /* Mobile joystick (drag anywhere) */
+    .joy {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      z-index: 40;
+    }
+    .joy-base {
+      position: absolute;
+      width: 120px;
+      height: 120px;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+      background: radial-gradient(circle at 35% 35%, rgba(255,255,255,0.10), rgba(255,255,255,0.04));
+      border: 1px solid rgba(255,255,255,0.14);
+      box-shadow: 0 18px 45px rgba(0,0,0,0.25);
+      backdrop-filter: blur(10px);
+    }
+    .joy-knob {
+      position: absolute;
+      width: 56px;
+      height: 56px;
+      border-radius: 999px;
+      transform: translate(-50%, -50%);
+      background: linear-gradient(135deg, rgba(250,204,21,0.85), rgba(34,197,94,0.70));
+      border: 1px solid rgba(255,255,255,0.18);
+      box-shadow: 0 14px 30px rgba(16,185,129,0.18);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .menu-aurora, .menu-grass, .logo-pop, .cta-btn, .petal, .fly, .menu-sheen::after { animation: none !important; }
+    }
   </style>
 </head>
 <body class="text-slate-100">
 
   <div class="fixed inset-0">
     <canvas id="game" class="absolute inset-0 h-screen w-screen block"></canvas>
+
+    <!-- Joystick overlay (drag anywhere) -->
+    <div id="joystick" class="joy hidden">
+      <div id="joyBase" class="joy-base"></div>
+      <div id="joyKnob" class="joy-knob"></div>
+    </div>
 
     <!-- HUD (أثناء اللعب فقط) -->
     <div id="hud" class="pointer-events-none absolute inset-x-0 top-0 p-3 hidden">
@@ -388,14 +427,21 @@
               </div>
 
               <div class="rounded-2xl border border-white/10 bg-white/5 p-4">
-                <div class="flex items-center justify-between">
-                  <div class="text-sm font-bold">تحكم الجوال</div>
+                <div class="text-sm font-bold">تحكم الجوال</div>
+
+                <div class="mt-3 flex flex-wrap gap-2">
+                  <button class="chip rounded-xl px-4 py-2 text-sm font-semibold" data-control="dpad" aria-pressed="true">D‑Pad</button>
+                  <button class="chip rounded-xl px-4 py-2 text-sm font-semibold" data-control="joystick" aria-pressed="false">Joystick</button>
+                </div>
+
+                <div class="mt-3 flex items-center justify-between">
+                  <div class="text-xs text-slate-300">إظهار التحكم على الشاشات اللمسية</div>
                   <label class="inline-flex items-center gap-2 text-sm">
                     <input id="toggleMobile" type="checkbox" class="h-4 w-4" />
-                    <span class="text-slate-200">إظهار D-Pad</span>
+                    <span class="text-slate-200">تفعيل</span>
                   </label>
                 </div>
-                <div class="mt-2 text-xs text-slate-300">يظهر تلقائيًا على الشاشات اللمسية عند تفعيله.</div>
+                <div class="mt-2 text-xs text-slate-300">D‑Pad: أزرار — Joystick: اسحب إصبعك في أي مكان لتحريك اللاعب.</div>
               </div>
 
               <div class="flex gap-2">
@@ -496,6 +542,12 @@
       const volume = document.getElementById('volume');
       const volumeLabel = document.getElementById('volumeLabel');
       const toggleMobile = document.getElementById('toggleMobile');
+      const controlButtons = Array.from(document.querySelectorAll('[data-control]'));
+
+      // Joystick elements
+      const joystick = document.getElementById('joystick');
+      const joyBase = document.getElementById('joyBase');
+      const joyKnob = document.getElementById('joyKnob');
 
       const bestScoreMenu = document.getElementById('bestScoreMenu');
 
@@ -520,6 +572,24 @@
       const CAMERA = { x: 0, y: 0, tx: 0, ty: 0 };
       const INPUT = { up: false, down: false, left: false, right: false };
 
+      // Virtual joystick (drag anywhere) state
+      let joyActive = false;
+      let joyId = null;
+      let joyBaseX = 0, joyBaseY = 0;
+      let joyX = 0, joyY = 0;
+      let joyVecX = 0, joyVecY = 0; // -1..1
+      const JOY_RADIUS = 46; // px
+      const JOY_DEADZONE = 0.12; // 0..1
+
+      function joyFiltered() {
+        const x = joyVecX;
+        const y = joyVecY;
+        const m = Math.hypot(x, y);
+        if (m < JOY_DEADZONE) return { x: 0, y: 0 };
+        const k = (m - JOY_DEADZONE) / (1 - JOY_DEADZONE);
+        return { x: (x / m) * k, y: (y / m) * k };
+      }
+
       const DIFF = {
         easy:   { zombies: 4,  zSpeed: 135, aggro: 320 },
         normal: { zombies: 7,  zSpeed: 165, aggro: 380 },
@@ -533,7 +603,8 @@
         difficulty: 'normal',
         sound: true,
         volume: 0.70,
-        mobileDpad: true
+        mobileDpad: true,
+        controlMode: 'dpad' // 'dpad' | 'joystick'
       };
 
       function loadSettings() {
@@ -546,6 +617,7 @@
               sound: typeof s.sound === 'boolean' ? s.sound : true,
               volume: typeof s.volume === 'number' ? clamp(s.volume, 0, 1) : 0.70,
               mobileDpad: typeof s.mobileDpad === 'boolean' ? s.mobileDpad : true,
+              controlMode: (s.controlMode === 'joystick' || s.controlMode === 'dpad') ? s.controlMode : 'dpad',
             };
           }
         } catch {}
@@ -575,6 +647,11 @@
         // Difficulty chips
         const diffButtons = Array.from(document.querySelectorAll('[data-diff]'));
         diffButtons.forEach(b => b.setAttribute('aria-pressed', b.dataset.diff === settings.difficulty ? 'true' : 'false'));
+
+        // Control mode chips
+        if (controlButtons && controlButtons.length) {
+          controlButtons.forEach(b => b.setAttribute('aria-pressed', b.dataset.control === settings.controlMode ? 'true' : 'false'));
+        }
 
         toggleSound.checked = !!settings.sound;
         volume.value = String(Math.round(settings.volume * 100));
@@ -896,8 +973,25 @@
 
       function updateControlVisibility() {
         const playingUI = (state === 'playing' || state === 'paused' || state === 'won' || state === 'dead');
-        const showDpad = playingUI && settings.mobileDpad && isTouchDevice();
+        const touch = isTouchDevice();
+        const enabled = playingUI && settings.mobileDpad && touch;
+
+        const showDpad = enabled && settings.controlMode === 'dpad';
+        const showJoy = enabled && settings.controlMode === 'joystick';
+
         mobileControls.classList.toggle('hidden', !showDpad);
+        if (joystick) joystick.classList.toggle('hidden', !showJoy);
+        if (showJoy) {
+          // joystick overlay should exist but be invisible until user drags
+          setJoyVisible(false);
+        } else {
+          // reset joystick state if hidden
+          joyActive = false;
+          joyId = null;
+          joyX = 0; joyY = 0;
+          joyVecX = 0; joyVecY = 0;
+          setJoyVisible(false);
+        }
       }
 
       function setState(next) {
@@ -1136,6 +1230,93 @@
       }
       bindDpad();
 
+      // ===== Drag-anywhere Joystick controls =====
+      function setJoyVisible(on) {
+        if (!joystick || !joyBase || !joyKnob) return;
+        // لا تغيّر pointer-events حتى لا تمنع أحداث اللمس عن الـcanvas
+        joyBase.style.opacity = on ? '1' : '0';
+        joyKnob.style.opacity = on ? '1' : '0';
+      }
+
+      function joyStart(e) {
+        if (state !== 'playing') return;
+        if (!settings.mobileDpad || settings.controlMode !== 'joystick') return;
+        if (!isTouchDevice()) return;
+
+        // ignore clicks on UI buttons
+        const target = e.target;
+        if (target && (target.closest && (target.closest('#hud') || target.closest('#mobileControls') || target.closest('#menu') || target.closest('#modal')))) return;
+
+        ensureAudio();
+
+        joyActive = true;
+        joyId = e.pointerId;
+        joyBaseX = e.clientX;
+        joyBaseY = e.clientY;
+        joyX = e.clientX;
+        joyY = e.clientY;
+        joyVecX = 0;
+        joyVecY = 0;
+
+        if (joystick) {
+          joystick.classList.remove('hidden');
+          joyBase.style.left = joyBaseX + 'px';
+          joyBase.style.top = joyBaseY + 'px';
+          joyKnob.style.left = joyBaseX + 'px';
+          joyKnob.style.top = joyBaseY + 'px';
+          setJoyVisible(true);
+        }
+
+        try { canvas.setPointerCapture(joyId); } catch {}
+        e.preventDefault();
+      }
+
+      function joyMove(e) {
+        if (!joyActive || e.pointerId !== joyId) return;
+        joyX = e.clientX;
+        joyY = e.clientY;
+
+        const dx = joyX - joyBaseX;
+        const dy = joyY - joyBaseY;
+        const d = Math.hypot(dx, dy) || 1;
+        const clamped = Math.min(JOY_RADIUS, d);
+        const nx = dx / d;
+        const ny = dy / d;
+
+        const kx = joyBaseX + nx * clamped;
+        const ky = joyBaseY + ny * clamped;
+
+        joyVecX = (kx - joyBaseX) / JOY_RADIUS;
+        joyVecY = (ky - joyBaseY) / JOY_RADIUS;
+
+        if (joyKnob) {
+          joyKnob.style.left = kx + 'px';
+          joyKnob.style.top = ky + 'px';
+        }
+        e.preventDefault();
+      }
+
+      function joyEnd(e) {
+        if (!joyActive || e.pointerId !== joyId) return;
+        joyActive = false;
+        joyId = null;
+        joyVecX = 0;
+        joyVecY = 0;
+        if (joystick) {
+          setJoyVisible(false);
+        }
+        e.preventDefault();
+      }
+
+      // Bind joystick to canvas (drag anywhere)
+      canvas.addEventListener('pointerdown', joyStart, { passive: false });
+      canvas.addEventListener('pointermove', joyMove, { passive: false });
+      canvas.addEventListener('pointerup', joyEnd, { passive: false });
+      canvas.addEventListener('pointercancel', joyEnd, { passive: false });
+      // ضمان إنهاء الجويستك حتى لو الإفلات حصل خارج الكانفاس
+      window.addEventListener('pointerup', joyEnd, { passive: false });
+      window.addEventListener('pointercancel', joyEnd, { passive: false });
+
       // أزرار HUD
       btnRestart.addEventListener('click', () => startGame());
       btnPause.addEventListener('click', () => setPaused(state !== 'paused'));
@@ -1173,6 +1354,20 @@
         volumeLabel.textContent = `${Math.round(settings.volume * 100)}%`;
       });
 
+      // اختيار نوع التحكم (D‑Pad / Joystick)
+      if (controlButtons && controlButtons.length) {
+        controlButtons.forEach(b => {
+          b.addEventListener('click', (e) => {
+            e.preventDefault();
+            ensureAudio();
+            settings.controlMode = (b.dataset.control === 'joystick') ? 'joystick' : 'dpad';
+            controlButtons.forEach(x => x.setAttribute('aria-pressed', x === b ? 'true' : 'false'));
+            updateControlVisibility();
+            playTone(740, 0.06, 'triangle', 0.06);
+          });
+        });
+      }
+
       toggleMobile.addEventListener('change', () => {
         settings.mobileDpad = toggleMobile.checked;
         updateControlVisibility();
@@ -1187,7 +1382,7 @@
 
       settingsReset.addEventListener('click', () => {
         ensureAudio();
-        settings = { difficulty: 'normal', sound: true, volume: 0.70, mobileDpad: true };
+        settings = { difficulty: 'normal', sound: true, volume: 0.70, mobileDpad: true, controlMode: 'dpad' };
         applySettingsToUI();
         saveSettings();
         playTone(330, 0.10, 'sine', 0.08);
@@ -1216,6 +1411,11 @@
 
       window.addEventListener('blur', () => {
         INPUT.up = INPUT.down = INPUT.left = INPUT.right = false;
+        joyActive = false;
+        joyId = null;
+        joyVecX = 0;
+        joyVecY = 0;
+        if (joystick) setJoyVisible(false);
       });
 
       // إعداد الكانفاس
@@ -1238,8 +1438,20 @@
         if (INPUT.right) ax += 1;
         if (INPUT.up) ay -= 1;
         if (INPUT.down) ay += 1;
-        const len = Math.hypot(ax, ay) || 1;
-        ax /= len; ay /= len;
+
+        // Joystick (Analog) — يعمل عند اختيار Joystick وفي اللعب وعلى الأجهزة اللمسية
+        if (settings.mobileDpad && settings.controlMode === 'joystick' && isTouchDevice()) {
+          const j = joyFiltered();
+          ax += j.x;
+          ay += j.y;
+        }
+
+        const len = Math.hypot(ax, ay);
+        if (len < 0.0001) {
+          ax = 0; ay = 0;
+        } else if (len > 1) {
+          ax /= len; ay /= len;
+        }
 
         const targetVx = ax * PLAYER.speed;
         const targetVy = ay * PLAYER.speed;
